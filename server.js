@@ -1,27 +1,14 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const { rng, pick, clamp, mean, solve, hash } = require('./math');
+const { LOCATIONS, ALGERIA_OUTLINE } = require('./geo');
+const { buildRouteRegistry } = require('./routes');
+const { createRecommendationService } = require('./recommend');
 
 const PORT = Number(process.env.PORT || 3030);
 const ROOT = __dirname;
 const DAY = 86_400_000;
-
-function rng(seed = 20261114) { let s = seed >>> 0; return () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296); }
-function pick(r, xs) { return xs[Math.floor(r() * xs.length)]; }
-function clamp(x, lo, hi) { return Math.min(hi, Math.max(lo, x)); }
-function mean(xs) { return xs.reduce((a, b) => a + b, 0) / xs.length; }
-function solve(A, b) {
-  const n = b.length, m = A.map((row, i) => [...row, b[i]]);
-  for (let col = 0; col < n; col++) {
-    let pivot = col;
-    for (let r = col + 1; r < n; r++) if (Math.abs(m[r][col]) > Math.abs(m[pivot][col])) pivot = r;
-    [m[col], m[pivot]] = [m[pivot], m[col]];
-    if (Math.abs(m[col][col]) < 1e-10) m[col][col] = 1e-10;
-    const d = m[col][col]; for (let j = col; j <= n; j++) m[col][j] /= d;
-    for (let r = 0; r < n; r++) if (r !== col) { const f = m[r][col]; for (let j = col; j <= n; j++) m[r][j] -= f * m[col][j]; }
-  }
-  return m.map(row => row[n]);
-}
 
 const cities = [
   { name: 'Rotterdam', country: 'Netherlands', port: 8 }, { name: 'Hamburg', country: 'Germany', port: 9 },
@@ -82,12 +69,14 @@ function fitModel(data) {
   const mae = mean(targets.map((y, i) => Math.abs(y - predictions[i])));
   const rmse = Math.sqrt(mean(targets.map((y, i) => (y - predictions[i]) ** 2)));
   const ssRes = targets.reduce((s, y, i) => s + (y - predictions[i]) ** 2, 0), ssTot = targets.reduce((s, y) => s + (y - targetMean) ** 2, 0);
-  return { predict, featureNames, categories, metrics: { mae, rmse, r2: 1 - ssRes / ssTot, train: train.length, test: test.length, method: 'Ridge regression' } };
+  return { predict, featureNames, categories, trainingRows: train, testRows: test, metrics: { mae, rmse, r2: 1 - ssRes / ssTot, train: train.length, test: test.length, method: 'Ridge regression' } };
 }
-function hash(s) { let h = 2166136261; for (const c of s) h = Math.imul(h ^ c.charCodeAt(0), 16777619); return h >>> 0; }
 
 const shipments = generateData();
 const model = fitModel(shipments);
+const modes = Object.keys(modeProfiles);
+const routeRegistry = buildRouteRegistry(model.trainingRows, LOCATIONS, modes);
+const recommender = createRecommendationService({ model, trainingRows: model.trainingRows, routeRegistry, modes });
 function summary(data) {
   const average = key => mean(data.map(x => x[key]));
   const total = key => data.reduce((s, x) => s + x[key], 0);
@@ -109,17 +98,63 @@ function json(res, code, body) { res.writeHead(code, { 'Content-Type': 'applicat
 function readBody(req) { return new Promise((resolve, reject) => { let raw = ''; req.on('data', c => raw += c); req.on('end', () => { try { resolve(JSON.parse(raw || '{}')); } catch { reject(new Error('Invalid JSON body')); } }); }); }
 function validInput(input) { const out = {}; for (const k of numeric) { const v = Number(input[k]); if (!Number.isFinite(v) || (['roadQuality', 'trafficIntensity', 'portCongestion', 'portEfficiency', 'logisticsConnectivity'].includes(k) && (v < 1 || v > 10)) || (['distanceKm', 'cargoWeightKg', 'fuelCost', 'labourCost', 'otherExpenses'].includes(k) && v < 0)) throw new Error(`Enter a valid ${k}.`); out[k] = v; } for (const k of categorical) { if (!model.categories[k].includes(input[k])) throw new Error(`Choose a valid ${k}.`); out[k] = input[k]; } return out; }
 
+function locationPayload() {
+  const counts = routeRegistry.countsByLocation();
+  return LOCATIONS.map(loc => ({
+    ...loc,
+    aliases: [...loc.aliases],
+    historicalRouteCount: counts[loc.name] || 0,
+    recommendationAvailable: Boolean(counts[loc.name])
+  }));
+}
+function fail(res, error) {
+  return json(res, error.status || 400, {
+    error: error.message || 'Request failed.',
+    code: error.code || 'REQUEST_FAILED',
+    ...(error.details ? { details: error.details } : {})
+  });
+}
+const CONTENT_TYPES = {
+  '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8'
+};
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
-    if (url.pathname === '/api/meta') return json(res, 200, { cities: cities.map(x => x.name), modes: Object.keys(modeProfiles), metrics: model.metrics, model: 'Ridge regression with train-only scaling and one-hot encoding', recordCount: shipments.length });
+    if (url.pathname === '/api/meta') return json(res, 200, {
+      cities: cities.map(x => x.name), modes, metrics: model.metrics,
+      model: 'Ridge regression with train-only scaling and one-hot encoding',
+      recordCount: shipments.length,
+      locations: LOCATIONS.map(loc => loc.name),
+      modelCities: cities.map(x => x.name),
+      geography: 'Algeria-focused map with a labelled external-network inset'
+    });
     if (url.pathname === '/api/dashboard') { const data = filtered(Object.fromEntries(url.searchParams)); if (!data.length) return json(res, 422, { error: 'No shipments match these filters.' }); return json(res, 200, summary(data)); }
     if (url.pathname === '/api/predict' && req.method === 'POST') { const input = validInput(await readBody(req)); const days = model.predict(input), cost = input.fuelCost + input.labourCost + input.otherExpenses; return json(res, 200, { days, cost, arrivalDate: new Date(Date.now() + days * DAY).toISOString(), metrics: model.metrics }); }
     if (url.pathname === '/api/scenario' && req.method === 'POST') { const body = await readBody(req), baseline = validInput(body.baseline), scenario = validInput(body.scenario), b = model.predict(baseline), s = model.predict(scenario); return json(res, 200, { baselineDays: b, scenarioDays: s, deltaDays: s - b, changePercent: (s - b) / b * 100 }); }
-    const file = url.pathname === '/' ? 'index.html' : url.pathname.replace(/^\//, '');
-    const target = path.resolve(ROOT, file); if (!target.startsWith(ROOT) || !fs.existsSync(target)) { res.writeHead(404); return res.end('Not found'); }
-    const type = target.endsWith('.html') ? 'text/html; charset=utf-8' : target.endsWith('.css') ? 'text/css; charset=utf-8' : 'application/javascript; charset=utf-8';
-    res.writeHead(200, { 'Content-Type': type }); fs.createReadStream(target).pipe(res);
-  } catch (error) { json(res, 400, { error: error.message || 'Request failed.' }); }
+    if (url.pathname === '/api/locations') return json(res, 200, {
+      locations: locationPayload(),
+      outline: ALGERIA_OUTLINE,
+      outlineSource: 'Simplified Natural Earth Algeria polygon (public domain)',
+      distanceUnit: 'km'
+    });
+    if (url.pathname === '/api/routes') return json(res, 200, {
+      routes: routeRegistry.list,
+      availableCount: routeRegistry.available.length,
+      missingCount: routeRegistry.list.length - routeRegistry.available.length,
+      distanceUnit: 'km',
+      provenance: 'Existing synthetic shipment distances from the training subset; no approximations or road geometry'
+    });
+    if (url.pathname === '/api/recommend' && req.method === 'POST') return json(res, 200, recommender.recommend(await readBody(req)));
+    if (url.pathname.startsWith('/api/')) return json(res, 404, { error: 'API endpoint not found.' });
+    const file = url.pathname === '/' ? 'index.html' : decodeURIComponent(url.pathname.replace(/^\//, ''));
+    const target = path.resolve(ROOT, file);
+    if (!target.startsWith(ROOT + path.sep) || !fs.existsSync(target) || !fs.statSync(target).isFile()) { res.writeHead(404); return res.end('Not found'); }
+    res.writeHead(200, { 'Content-Type': CONTENT_TYPES[path.extname(target)] || 'application/octet-stream' });
+    fs.createReadStream(target).pipe(res);
+  } catch (error) { fail(res, error); }
 });
-server.listen(PORT, () => console.log(`Delivery Time Prediction and Analytics Platform: http://localhost:${PORT}`));
+if (require.main === module) server.listen(PORT, () => console.log(`Delivery Time Prediction and Analytics Platform: http://localhost:${PORT}`));
+
+module.exports = { server, shipments, model, modes, routeRegistry, recommender, cities, modeProfiles, fitModel, generateData, locationPayload };
