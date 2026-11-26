@@ -94,7 +94,11 @@ function summary(data) {
 }
 function averageOf(rows, key) { return mean(rows.map(x => x[key])); }
 function filtered(query) { return shipments.filter(x => (!query.mode || x.mode === query.mode) && (!query.origin || x.origin === query.origin) && (!query.destination || x.destination === query.destination) && (!query.severity || (query.severity === 'bottleneck' ? (x.trafficIntensity >= 8 || x.roadQuality <= 3 || x.portCongestion >= 8) : !(x.trafficIntensity >= 8 || x.roadQuality <= 3 || x.portCongestion >= 8)))); }
-function json(res, code, body) { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(body)); }
+function json(res, code, body) {
+  const payload = { success: code < 400, ...body };
+  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+  res.end(JSON.stringify(payload));
+}
 function readBody(req) { return new Promise((resolve, reject) => { let raw = ''; req.on('data', c => raw += c); req.on('end', () => { try { resolve(JSON.parse(raw || '{}')); } catch { reject(new Error('Invalid JSON body')); } }); }); }
 function validInput(input) { const out = {}; for (const k of numeric) { const v = Number(input[k]); if (!Number.isFinite(v) || (['roadQuality', 'trafficIntensity', 'portCongestion', 'portEfficiency', 'logisticsConnectivity'].includes(k) && (v < 1 || v > 10)) || (['distanceKm', 'cargoWeightKg', 'fuelCost', 'labourCost', 'otherExpenses'].includes(k) && v < 0)) throw new Error(`Enter a valid ${k}.`); out[k] = v; } for (const k of categorical) { if (!model.categories[k].includes(input[k])) throw new Error(`Choose a valid ${k}.`); out[k] = input[k]; } return out; }
 
@@ -109,52 +113,94 @@ function locationPayload() {
 }
 function fail(res, error) {
   return json(res, error.status || 400, {
+    success: false,
     error: error.message || 'Request failed.',
     code: error.code || 'REQUEST_FAILED',
     ...(error.details ? { details: error.details } : {})
   });
 }
+const methodError = () => Object.assign(new Error('Method not allowed.'), { status: 405, code: 'METHOD_NOT_ALLOWED' });
 const CONTENT_TYPES = {
   '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8',
   '.js': 'application/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8'
 };
 
-const server = http.createServer(async (req, res) => {
+async function handleRequest(req, res) {
   try {
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    if (url.pathname === '/api/meta') return json(res, 200, {
-      cities: cities.map(x => x.name), modes, metrics: model.metrics,
-      model: 'Ridge regression with train-only scaling and one-hot encoding',
-      recordCount: shipments.length,
-      locations: LOCATIONS.map(loc => loc.name),
-      modelCities: cities.map(x => x.name),
-      geography: 'Algeria-focused map with a labelled external-network inset'
-    });
-    if (url.pathname === '/api/dashboard') { const data = filtered(Object.fromEntries(url.searchParams)); if (!data.length) return json(res, 422, { error: 'No shipments match these filters.' }); return json(res, 200, summary(data)); }
-    if (url.pathname === '/api/predict' && req.method === 'POST') { const input = validInput(await readBody(req)); const days = model.predict(input), cost = input.fuelCost + input.labourCost + input.otherExpenses; return json(res, 200, { days, cost, arrivalDate: new Date(Date.now() + days * DAY).toISOString(), metrics: model.metrics }); }
-    if (url.pathname === '/api/scenario' && req.method === 'POST') { const body = await readBody(req), baseline = validInput(body.baseline), scenario = validInput(body.scenario), b = model.predict(baseline), s = model.predict(scenario); return json(res, 200, { baselineDays: b, scenarioDays: s, deltaDays: s - b, changePercent: (s - b) / b * 100 }); }
-    if (url.pathname === '/api/locations') return json(res, 200, {
-      locations: locationPayload(),
-      outline: ALGERIA_OUTLINE,
-      outlineSource: 'Simplified Natural Earth Algeria polygon (public domain)',
-      distanceUnit: 'km'
-    });
-    if (url.pathname === '/api/routes') return json(res, 200, {
-      routes: routeRegistry.list,
-      availableCount: routeRegistry.available.length,
-      missingCount: routeRegistry.list.length - routeRegistry.available.length,
-      distanceUnit: 'km',
-      provenance: 'Existing synthetic shipment distances from the training subset; no approximations or road geometry'
-    });
-    if (url.pathname === '/api/recommend' && req.method === 'POST') return json(res, 200, recommender.recommend(await readBody(req)));
-    if (url.pathname.startsWith('/api/')) return json(res, 404, { error: 'API endpoint not found.' });
+    const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    if (url.pathname === '/api/health') {
+      if (req.method !== 'GET') throw methodError();
+      return json(res, 200, {
+        status: 'ok', service: 'transitiq-model', model: 'Ridge regression',
+        recordCount: shipments.length, metrics: model.metrics
+      });
+    }
+    if (url.pathname === '/api/config') {
+      if (req.method !== 'GET') throw methodError();
+      const apiBase = String(process.env.MODEL_API_BASE || '').replace(/\/$/, '');
+      return json(res, 200, { apiBase, modelService: apiBase ? 'external' : 'same-origin' });
+    }
+    if (url.pathname === '/api/meta') {
+      if (req.method !== 'GET') throw methodError();
+      return json(res, 200, {
+        cities: cities.map(x => x.name), modes, metrics: model.metrics,
+        model: 'Ridge regression with train-only scaling and one-hot encoding',
+        recordCount: shipments.length,
+        locations: LOCATIONS.map(loc => loc.name),
+        modelCities: cities.map(x => x.name),
+        geography: 'Algeria-focused map with a labelled external-network inset'
+      });
+    }
+    if (url.pathname === '/api/dashboard') {
+      if (req.method !== 'GET') throw methodError();
+      const data = filtered(Object.fromEntries(url.searchParams));
+      if (!data.length) return json(res, 422, { error: 'No shipments match these filters.' });
+      return json(res, 200, summary(data));
+    }
+    if (url.pathname === '/api/predict') {
+      if (req.method !== 'POST') throw methodError();
+      const input = validInput(await readBody(req));
+      const days = model.predict(input), cost = input.fuelCost + input.labourCost + input.otherExpenses;
+      return json(res, 200, { days, cost, arrivalDate: new Date(Date.now() + days * DAY).toISOString(), metrics: model.metrics });
+    }
+    if (url.pathname === '/api/scenario') {
+      if (req.method !== 'POST') throw methodError();
+      const body = await readBody(req), baseline = validInput(body.baseline), scenario = validInput(body.scenario);
+      const b = model.predict(baseline), s = model.predict(scenario);
+      return json(res, 200, { baselineDays: b, scenarioDays: s, deltaDays: s - b, changePercent: (s - b) / b * 100 });
+    }
+    if (url.pathname === '/api/locations') {
+      if (req.method !== 'GET') throw methodError();
+      return json(res, 200, {
+        locations: locationPayload(),
+        outline: ALGERIA_OUTLINE,
+        outlineSource: 'Simplified Natural Earth Algeria polygon (public domain)',
+        distanceUnit: 'km'
+      });
+    }
+    if (url.pathname === '/api/routes') {
+      if (req.method !== 'GET') throw methodError();
+      return json(res, 200, {
+        routes: routeRegistry.list,
+        availableCount: routeRegistry.available.length,
+        missingCount: routeRegistry.list.length - routeRegistry.available.length,
+        distanceUnit: 'km',
+        provenance: 'Existing synthetic shipment distances from the training subset; no approximations or road geometry'
+      });
+    }
+    if (url.pathname === '/api/recommend') {
+      if (req.method !== 'POST') throw methodError();
+      return json(res, 200, recommender.recommend(await readBody(req)));
+    }
+    if (url.pathname.startsWith('/api/')) throw Object.assign(new Error('API endpoint not found.'), { status: 404, code: 'NOT_FOUND' });
     const file = url.pathname === '/' ? 'index.html' : decodeURIComponent(url.pathname.replace(/^\//, ''));
     const target = path.resolve(ROOT, file);
     if (!target.startsWith(ROOT + path.sep) || !fs.existsSync(target) || !fs.statSync(target).isFile()) { res.writeHead(404); return res.end('Not found'); }
     res.writeHead(200, { 'Content-Type': CONTENT_TYPES[path.extname(target)] || 'application/octet-stream' });
     fs.createReadStream(target).pipe(res);
   } catch (error) { fail(res, error); }
-});
+}
+const server = http.createServer(handleRequest);
 if (require.main === module) server.listen(PORT, () => console.log(`Delivery Time Prediction and Analytics Platform: http://localhost:${PORT}`));
 
-module.exports = { server, shipments, model, modes, routeRegistry, recommender, cities, modeProfiles, fitModel, generateData, locationPayload };
+module.exports = { server, handleRequest, shipments, model, modes, routeRegistry, recommender, cities, modeProfiles, fitModel, generateData, locationPayload };

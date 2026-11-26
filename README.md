@@ -7,7 +7,7 @@ A local, dependency-free Node.js application that generates 900 synthetic shipme
 1. Double-click `run-platform.bat`, or open PowerShell in this folder and run `node server.js`.
 2. Open `http://localhost:3030`.
 
-No packages, external API keys, database, or internet connection are required at runtime.
+No packages, external API keys, database, or internet connection are required at runtime. On Vercel, the same API is exposed through serverless functions in `api/`, so the deployed frontend talks to its own origin. See [Deployment](#deployment-vercel).
 
 Run the verification suite with:
 
@@ -33,7 +33,11 @@ The dashboard KPIs and held-out metrics remain:
 
 | File | Responsibility |
 |---|---|
-| `server.js` | HTTP server, original dataset/model, API routes, static file serving. |
+| `server.js` | HTTP server, original dataset/model, API routes, static file serving. Exports `handleRequest` for serverless reuse. |
+| `api-client.js` | Shared fetch wrapper: status/content-type checks, safe JSON parsing, structured errors. |
+| `api/*.js` | Vercel serverless entry points that delegate to `server.js`. |
+| `vercel.json` | Vercel runtime declaration and no-store headers for `/api/*`. |
+| `package.json` | Node engine and local/Vercel scripts. No dependencies. |
 | `math.js` | Shared seeded RNG, statistics, Gaussian elimination, and ID hash. |
 | `geo.js` | Location registry, aliases, coordinates, and simplified Algeria outline. |
 | `routes.js` | Route registry and distance provenance derived from training records. |
@@ -114,10 +118,12 @@ The dataset contains only synthetic `orderDate` values. It has no departure hour
 
 ## API
 
-All responses are JSON with `Cache-Control: no-store`. Errors use `{ error, code, details? }`.
+Every endpoint returns `Content-Type: application/json; charset=utf-8` and `Cache-Control: no-store`. Success bodies include `"success": true`; errors include `"success": false`, `error`, `code`, and optional `details`. Unsupported methods return `405`, unknown API paths return `404`, and malformed request bodies are rejected with `400` — all as JSON, never HTML.
 
 | Endpoint | Method | Description |
 |---|---|---|
+| `/api/health` | GET | Real health check. Returns `status: "ok"` only when the model module has loaded and can serve requests. |
+| `/api/config` | GET | Returns `apiBase` from `MODEL_API_BASE`, or `""` to use the same origin. Used by the frontend before other calls. |
 | `/api/meta` | GET | Original dataset cities, modes, metrics, record count, plus the geographic location list. |
 | `/api/dashboard` | GET | Existing filtered dashboard summary. |
 | `/api/predict` | POST | Existing manual baseline prediction. |
@@ -139,7 +145,20 @@ Example recommendation request:
 }
 ```
 
-Important error codes: `INVALID_ORIGIN`, `INVALID_DESTINATION`, `SAME_LOCATION`, `INVALID_LOAD`, `INVALID_OBJECTIVE`, `UNSUPPORTED_MODE`, `INVALID_DEPARTURE`, `NO_HISTORICAL_ROUTE`, `NO_VALID_CANDIDATES`, `INVALID_JSON_BODY`.
+Important error codes: `INVALID_ORIGIN`, `INVALID_DESTINATION`, `SAME_LOCATION`, `INVALID_LOAD`, `INVALID_OBJECTIVE`, `UNSUPPORTED_MODE`, `INVALID_DEPARTURE`, `NO_HISTORICAL_ROUTE`, `NO_VALID_CANDIDATES`, `INVALID_JSON_BODY`, `METHOD_NOT_ALLOWED`, `NOT_FOUND`. Client-side codes: `NETWORK_ERROR`, `INVALID_RESPONSE`, `INVALID_JSON`, `API_ERROR`.
+
+## Deployment (Vercel)
+
+The previous deployment was static-only: requests to `/api/meta` were answered by Vercel's static/404 HTML page, so `response.json()` failed with `JSON.parse: unexpected character at line 1 column 1`. The model itself was never reached. This is now fixed by deploying the API as serverless functions on the same origin.
+
+Steps:
+
+1. Import this repository into Vercel. `vercel.json` sets `framework: null` so the root HTML/JS files are served statically and `api/*.js` files are compiled as Node serverless functions.
+2. Leave `MODEL_API_BASE` unset for the recommended setup. The frontend calls `/api/config`, receives `apiBase: ""`, and uses same-origin `/api/*` URLs served by `api/health.js`, `api/meta.js`, etc. No `localhost` or `127.0.0.1` URL is used in production.
+3. If the model must run as a separate hosted service instead, set the Vercel project environment variable `MODEL_API_BASE` to that service's public HTTPS origin, for example `https://transitiq-api.example.com` (no trailing slash). `/api/config` returns that value and the frontend uses it for all subsequent API calls. The backend must implement the same endpoints and JSON contract. Do not set it to a local address.
+4. Redeploy after changing environment variables. `npm test` must pass before deployment.
+
+The dashboard header now calls `/api/health` at startup. It shows “Model service online” only after a valid JSON `status: "ok"` response; otherwise it shows “Checking model service…”, “Model service degraded”, or “Model service unavailable” and displays a readable banner instead of the old `alert()` message.
 
 ## Synthetic-data limitations
 

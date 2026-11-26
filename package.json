@@ -1,0 +1,14 @@
+{
+  "name": "transitiq-delivery-platform",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Offline-capable logistics analytics dashboard with Ridge regression predictions and a same-origin Vercel API.",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js",
+    "check": "node --check server.js && node --check app.js && node --check api-client.js && node --check api/_handler.js"
+  }
+}

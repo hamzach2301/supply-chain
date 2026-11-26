@@ -1,7 +1,8 @@
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
-const { shipments, model, modes, routeRegistry, recommender, locationPayload } = require('./server');
+const { server, shipments, model, modes, routeRegistry, recommender, locationPayload } = require('./server');
 const { ALGERIA_OUTLINE } = require('./geo');
+const apiClient = require('./api-client');
 const DAY = 86_400_000;
 const BASE_DATA_HASH = 'bd48651d21965b5fa6d5ce764f54a5b441611f1b220584ed6c867d58ac888f60';
 const BASE_METRICS = { mae: 0.5387861068126258, rmse: 0.6760210385419094, r2: 0.9612552472168814, train: 720, test: 180 };
@@ -109,4 +110,76 @@ expectError(() => recommender.recommend({ ...base, origin: 'Alger', destination:
 assert(locationPayload().find(loc => loc.name === 'Algiers').aliases.includes('Alger'));
 pass('Algiers alias resolves and still hits the explicit no-history guard');
 
-console.log(`\n${checked} test groups passed.`);
+(async () => {
+  console.log('HTTP API contract');
+  await new Promise(resolve => server.listen(0, resolve));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  const request = (path, options) => fetch(origin + path, options);
+  const parse = async response => ({ response, body: await response.json() });
+
+  const health = await parse(await request('/api/health'));
+  assert.equal(health.response.status, 200);
+  assert.match(health.response.headers.get('content-type'), /application\/json/i);
+  assert.equal(health.body.success, true);
+  assert.equal(health.body.status, 'ok');
+  pass('/api/health returns valid JSON and an ok status');
+
+  const config = (await parse(await request('/api/config'))).body;
+  assert.equal(typeof config.apiBase, 'string');
+  assert(!/^(https?:\/\/)?(localhost|127\.0\.0\.1)/i.test(config.apiBase));
+  pass('/api/config exposes a non-localhost API base');
+
+  const meta = (await parse(await request('/api/meta'))).body;
+  assert.equal(meta.success, true);
+  assert.equal(meta.cities.length, 10);
+  pass('/api/meta returns structured JSON with a success flag');
+
+  const dashboardData = (await parse(await request('/api/dashboard'))).body;
+  assert.equal(dashboardData.success, true);
+  assert(Math.abs(dashboardData.kpis.averageDays - 5.2267666666666655) < 1e-9);
+  pass('/api/dashboard preserves analytics values');
+
+  const shipment = { origin: 'Rotterdam', destination: 'Hamburg', mode: 'Road', distanceKm: 520, cargoWeightKg: 6200, fuelCost: 125, labourCost: 87, otherExpenses: 46, roadQuality: 5, trafficIntensity: 8, portCongestion: 4, portEfficiency: 6, logisticsConnectivity: 6 };
+  const post = (path, body) => request(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const prediction = (await parse(await post('/api/predict', shipment))).body;
+  assert.equal(prediction.success, true);
+  assert(prediction.days > 0);
+  pass('/api/predict returns a valid JSON prediction');
+
+  const scenarioData = (await parse(await post('/api/scenario', { baseline: shipment, scenario: { ...shipment, trafficIntensity: 3 } }))).body;
+  assert.equal(scenarioData.success, true);
+  assert.equal(typeof scenarioData.deltaDays, 'number');
+  pass('/api/scenario returns a valid JSON comparison');
+
+  const notFound = await parse(await request('/api/does-not-exist'));
+  assert.equal(notFound.response.status, 404);
+  assert.equal(notFound.body.success, false);
+  assert.equal(notFound.body.code, 'NOT_FOUND');
+  const wrongMethod = await parse(await request('/api/predict'));
+  assert.equal(wrongMethod.response.status, 405);
+  assert.equal(wrongMethod.body.code, 'METHOD_NOT_ALLOWED');
+  pass('unknown routes and wrong methods return structured JSON errors');
+
+  console.log('API client response handling');
+  const jsonResponse = (body, status = 200) => ({
+    ok: status >= 200 && status < 300, status, statusText: status === 200 ? 'OK' : 'Error',
+    headers: { get: () => 'application/json; charset=utf-8' },
+    json: async () => body, text: async () => JSON.stringify(body)
+  });
+  const htmlResponse = status => ({
+    ok: status >= 200 && status < 300, status, statusText: status === 200 ? 'OK' : 'Not Found',
+    headers: { get: () => 'text/html; charset=utf-8' },
+    text: async () => '<html>model service page</html>',
+    json: async () => { throw new Error('Unexpected token <'); }
+  });
+  const healthy = await apiClient.request(async () => jsonResponse({ success: true, status: 'ok' }), 'http://service/api/health');
+  assert.equal(healthy.status, 'ok');
+  await assert.rejects(apiClient.request(async () => htmlResponse(200), 'http://service/api/meta'), e => e.code === 'INVALID_RESPONSE');
+  await assert.rejects(apiClient.request(async () => htmlResponse(404), 'http://service/api/meta'), e => e.code === 'INVALID_RESPONSE' && e.status === 404);
+  await assert.rejects(apiClient.request(async () => jsonResponse({ success: false, error: 'Model service unavailable' }, 503), 'http://service/api/meta'), e => e.status === 503 && /unavailable/.test(e.message));
+  await assert.rejects(apiClient.request(async () => { throw new Error('offline'); }, 'http://service/api/meta'), e => e.code === 'NETWORK_ERROR');
+  pass('client rejects HTML, error JSON, and network failures without calling json() blindly');
+
+  await new Promise(resolve => server.close(resolve));
+  console.log(`\n${checked} test groups passed.`);
+})().catch(error => { console.error(error); process.exitCode = 1; });
